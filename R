@@ -1,0 +1,141 @@
+library(quantmod)
+library(PerformanceAnalytics)
+library(quadprog)
+library(ggplot2)
+library(tidyverse)
+
+
+# Tickers analisados
+tickers <- c("CEDO3.SA", "MRSA3B.SA", "PCAR3.SA", "MRSA5B.SA",
+             "INEP3.SA", "LOGG3.SA", "EALT3.SA", "CBEE3.SA")
+
+# Período de análise
+start_date <- as.Date("2019-01-04")
+end_date   <- as.Date("2019-12-30")
+
+# Obter dados do Yahoo Finance
+getSymbols(tickers, from = start_date, to = end_date, src = "yahoo")
+
+# Extrair somente os preços de fechamento ajustados
+price_list <- lapply(tickers, function(ticker) {
+  Cl(get(ticker))
+})
+
+# Combinar em um único objeto xts
+prices <- do.call(merge, price_list)
+colnames(prices) <- tickers
+
+# Calcular retornos logarítmicos diários e remover valores NA
+returns <- na.omit(Return.calculate(prices, method = "log"))
+
+# Retorno médio diário
+mean_returns <- colMeans(returns)
+
+# Matriz de covariância dos retornos
+cov_matrix <- cov(returns)
+
+# Número de ativos
+n_assets <- ncol(returns)
+
+
+
+
+# Função para resolver a mínima variância dado um retorno alvo
+efficient_portfolio <- function(target_return, mean_returns, cov_matrix) {
+  dvec <- rep(0, n_assets)
+  Dmat <- 2 * cov_matrix  
+
+  A_eq <- rbind(rep(1, n_assets), mean_returns)
+  b_eq <- c(1, target_return)
+  
+  Amat <- rbind(A_eq, -A_eq, diag(n_assets), -diag(n_assets))
+  bvec <- c(b_eq, -b_eq, rep(0, n_assets), rep(0, n_assets))
+  
+  # Resolver
+  sol <- solve.QP(Dmat, dvec, t(Amat), bvec, meq = 2)
+  
+  weights <- sol$solution
+  return(weights)
+}
+
+
+# Criar um grid de retornos-alvo possíveis
+min_return <- min(mean_returns) * 0.9
+max_return <- max(mean_returns) * 1.1
+n_portfolios <- 50
+target_returns <- seq(min_return, max_return, length.out = n_portfolios)
+
+# Listas para guardar resultados
+frontier_weights <- list()
+frontier_risks   <- c()
+frontier_means   <- c()
+
+for (tr in target_returns) {
+  w <- tryCatch({
+    efficient_portfolio(tr, mean_returns, cov_matrix)
+  }, error = function(e) {
+    rep(NA, n_assets)
+  })
+  if (any(is.na(w))) {
+    # Se a otimização falhar, pula
+    next
+  }
+  frontier_weights[[length(frontier_weights) + 1]] <- w
+  ret_p <- sum(w * mean_returns)
+  var_p <- t(w) %*% cov_matrix %*% w
+  frontier_means <- c(frontier_means, ret_p)
+  frontier_risks <- c(frontier_risks, sqrt(var_p))
+}
+
+# Definir taxa livre de risco (anual). 
+rf_annual <- 0.11
+
+# Função que dado um vetor de weights retorna o negativo do Sharpe
+neg_sharpe <- function(w, mean_returns, cov_matrix, rf = rf_annual) {
+  w <- w / sum(w)  
+  port_return <- sum(w * mean_returns) * 252  
+  port_risk   <- sqrt(t(w) %*% cov_matrix %*% w) * sqrt(252)
+  sharpe      <- (port_return - rf) / port_risk
+  return(-sharpe)
+}
+
+# Precisamos de restrição sum(w_i)=1 e w_i>=0. 'nlminb' ou 'optim'
+max_sharpe_portfolio <- function(mean_returns, cov_matrix, rf = rf_annual) {
+  n <- length(mean_returns)
+  w0 <- rep(1/n, n)  # chute inicial
+
+  
+  # Otimização via 'optim'
+  res <- optim(
+    par = w0,
+    fn = neg_sharpe,
+    mean_returns = mean_returns,
+    cov_matrix   = cov_matrix,
+    rf           = rf,
+    method       = "L-BFGS-B",
+    lower        = rep(0, n),
+    upper        = rep(1, n),
+   
+    control      = list(maxit = 1000)
+  )
+  
+  # Normaliza pesos para somar 1
+  w_opt <- res$par / sum(res$par)
+  return(w_opt)
+}
+
+w_tan <- max_sharpe_portfolio(mean_returns, cov_matrix, rf_annual)
+
+# Estatísticas da carteira tangente
+ret_tan_annual  <- sum(w_tan * mean_returns) * 252
+risk_tan_annual <- sqrt(t(w_tan) %*% cov_matrix %*% w_tan) * sqrt(252)
+sharpe_tan      <- (ret_tan_annual - rf_annual) / risk_tan_annual
+
+cat("Pesos da carteira tangente (CML):\n")
+print(w_tan)
+cat("Retorno anualizado da carteira tangente: ", ret_tan_annual, "\n")
+cat("Risco anualizado (desvio-padrão): ", risk_tan_annual, "\n")
+cat("Índice de Sharpe: ", sharpe_tan, "\n")
+
+
+
